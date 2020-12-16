@@ -1,0 +1,1 @@
+cmd='/usr/bin/cmake;-DSDKCONFIG=/home/jordan/esp/esp32-i2s-recorder/i2s/sdkconfig;-DIDF_PATH=/home/jordan/esp/esp-idf;-DIDF_TARGET=esp32;-DPYTHON_DEPS_CHECKED=1;-DPYTHON=/home/jordan/.espressif/python_env/idf4.3_py3.6_env/bin/python;-DEXTRA_COMPONENT_DIRS=/home/jordan/esp/esp-idf/components/bootloader;-DLEGACY_INCLUDE_COMMON_HEADERS=;-GNinja;<SOURCE_DIR><SOURCE_SUBDIR>'
