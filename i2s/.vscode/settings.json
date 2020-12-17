@@ -8,5 +8,10 @@
     "editor.quickSuggestions": true
   },
   "C_Cpp.intelliSenseEngineFallback": "Enabled",
-  "idf.port": "/dev/ttyUSB0"
+  "idf.port": "/dev/ttyUSB0",
+  "files.associations": {
+    "*.ipp": "c",
+    "*.tcc": "c",
+    "*.inc": "c"
+  }
 }
