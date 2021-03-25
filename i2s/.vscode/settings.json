@@ -13,5 +13,6 @@
     "*.ipp": "c",
     "*.tcc": "c",
     "*.inc": "c"
-  }
+  },
+  "idf.flashType": "UART"
 }
