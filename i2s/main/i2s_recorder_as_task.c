@@ -31,9 +31,9 @@
 static const char *TAG = "i2s_recorder";
 
 #define SAMPLE_RATE     (48000)
-#define I2S_BITS_PER_SAMPLE I2S_BITS_PER_SAMPLE_32BIT
+#define I2S_BITS_PER_SAMPLE I2S_BITS_PER_SAMPLE_16BIT
 #define FILE_BITS_PER_SAMPLE (16)
-#define RECBUF_SIZE     (SAMPLE_RATE*FILE_BITS_PER_SAMPLE*2)    // 1 second
+#define RECBUF_SIZE     (SAMPLE_RATE*(FILE_BITS_PER_SAMPLE/8)*2)    // 1 second
 #define NUM_RECBUFS     (8)
 #define MAX_SAMPLES     (256)
 #define I2S_NUM         (0)
@@ -63,21 +63,68 @@ xTaskHandle TaskHandle_Task1;
 
 void i2s_init(void);
 void sd_init(void);
-void main_task(void * pvParameters);
+void sd_deinit(void);
+void i2s_task(void * pvParameters);
+void sd_task(void * pvParameters);
+void get_timestamps(int *seconds, char *datetime, size_t datetime_size);
 
-int32_t buffer32[MAX_SAMPLES] = {0};
-sdmmc_card_t* card;
+sdmmc_card_t *card;
 const char mount_point[] = MOUNT_POINT;
 QueueHandle_t queue;
 void *buffer[NUM_RECBUFS];
-typedef struct qe 
-{
+
+// structure of a command on the msg q
+typedef struct qm {
     /* data */
-    char filename[256];
-    uint32_t seqno;
+    char filename[128]; // this is just the timestamp part
+    int seqno;
     void *buffer;
-    size_t buf_len;
-} q_entry;
+    size_t len;
+} q_msg;
+
+// structure of a WAV file header
+// WAV header spec information:
+//https://web.archive.org/web/20140327141505/https://ccrma.stanford.edu/courses/422/projects/WaveFormat/
+//http://www.topherlee.com/software/pcm-tut-wavformat.html
+
+typedef struct wav_header {
+    // RIFF Header
+    char riff_header[4]; // Contains "RIFF"
+    uint32_t wav_size; // Size of the wav portion of the file, which follows the first 8 bytes. File size - 8
+    char wave_header[4]; // Contains "WAVE"
+    
+    // Format Header
+    char fmt_header[4]; // Contains "fmt " (includes trailing space)
+    uint32_t fmt_chunk_size; // Should be 16 for PCM
+    uint16_t audio_format; // Should be 1 for PCM. 3 for IEEE Float
+    uint16_t num_channels;
+    uint32_t sample_rate;
+    uint32_t byte_rate; // Number of bytes per second. sample_rate * num_channels * Bytes Per Sample
+    uint16_t sample_alignment; // num_channels * Bytes Per Sample
+    uint16_t bit_depth; // Number of bits per sample
+    
+    // Data
+    char data_header[4]; // Contains "data"
+    uint32_t data_bytes; // Number of bytes in data. Number of samples * num_channels * sample byte size
+    // uint8_t bytes[]; // Remainder of wave file is bytes
+} wav_header;
+
+wav_header wav_hdr = {
+    "RIFF", 
+    0, 
+    "WAVE", 
+    "fmt ", 
+    16, 
+    1, 
+    2, 
+    48000, 
+    48000*2*2, 
+    2*2, 
+    16, 
+    "data", 
+    0
+};
+
 
 
 
@@ -94,65 +141,140 @@ void app_main(void)
     }
 
     // Allocate a queue, with max depth corresponding to the number of buffers
+    queue = xQueueCreate(NUM_RECBUFS, sizeof(q_msg));
+    if (queue == 0) {
+        // Queue was not created and must not be used.
+        ESP_LOGE(TAG, "Failed to allocate a queue.");
+    }
 
-
-    xTaskCreatePinnedToCore(main_task, "i2s_record", 8192, NULL, 1, NULL, APP_CPU);
+    // Create two tasks on different cores:
+    // 1. Dedicated to reading data from I2S, higher priority
+    // 2. Dedicated to writing data to SD card, lower priority
+    xTaskCreatePinnedToCore(i2s_task, "i2s_task", 8192, NULL, 2, NULL, APP_CPU);
+    xTaskCreatePinnedToCore(sd_task, "sd_task", 8192, NULL, 1, NULL, PRO_CPU);
 }
 
-void main_task(void * pvParameters) {
+void sd_task(void * pvParameters) {
+    ESP_LOGI(TAG, "sd_task, starting up.");
     sd_init();
+    static char prev_filename[256];
+    static uint32_t audio_bytes = 0;
 
-    // First create a file.
-    ESP_LOGI(TAG, "Opening file");
-    FILE* f = fopen(MOUNT_POINT"/60s.raw", "w");
-    if (f == NULL) {
-        ESP_LOGE(TAG, "Failed to open file for writing");
-        return;
+    while (true) {
+        BaseType_t qrc;
+        q_msg m;
+        char filename[256];
+        size_t written;
+
+        // Read a command from the queue, wait for up to 2 seconds
+        while ((qrc = xQueueReceive(queue, (void *)&m, 2000 / portTICK_PERIOD_MS))
+            != pdTRUE) {
+            // There's nothing on the queue, log an info, and try again
+            ESP_LOGI(TAG, "sd_task: nothing on queue.");
+        }
+
+        // Now we have got a queue element, write the buffer to disk
+        // The filename is in the Q msg, less the .raw suffix
+        sprintf(filename, "%s/%s.wav", MOUNT_POINT, m.filename);
+        strncpy(prev_filename, filename, sizeof prev_filename);
+
+        FILE* f = fopen(filename, "a");
+        if (f == NULL) {
+            ESP_LOGE(TAG, "sd_task: Failed to open file, %s", filename);
+            continue;  // skip to next iteration, hope it works better next time
+        }
+
+        // If the seqno indicates this is the first buffer of a new file
+        // do some initialisation.
+        if (m.seqno == 0 || audio_bytes == 0) {
+            audio_bytes = 0;
+            if (fwrite((void *)&wav_hdr, 1, sizeof wav_hdr, f) < sizeof wav_hdr) {
+                ESP_LOGE(TAG, "sd_task: Failed to write WAV header");
+                fclose(f);
+                continue;                 
+            } else {
+                ESP_LOGI(TAG, "sd_task: Wrote WAV header");               
+            }
+        }
+
+        if ((written = fwrite(m.buffer, 1, m.len, f)) < m.len) {
+            ESP_LOGE(
+                TAG, 
+                "sd_task: Failed to write all samples, len=%d, written=%d",
+                m.len,
+                written);
+            audio_bytes += written;
+            fclose(f);
+            continue; 
+        } else {
+            ESP_LOGI(
+                TAG, 
+                "sd_task: Wrote file: %s, seqno: %d, bytes: %d", 
+                filename, 
+                m.seqno,
+                written);
+            audio_bytes += written;
+            fclose(f);
+        }
     }
+}
+
+void i2s_task(void * pvParameters) {
+    ESP_LOGI(TAG, "i2s_task, starting up.");
 
     // Initialise the I2S bus
     i2s_init();
 
-    // Loop reading from I2S and writing to file
-    size_t samplesWritten = 0;
-    while (samplesWritten < 48000 * 2 * 180) {
+    uint8_t buf_index = 0;
+
+    while (true) {
+
+        // Loop reading from I2S and writing to a buffer
         size_t bytesRead = 0;
 
         esp_err_t rc;
 
-        rc = i2s_read(I2S_NUM, buffer32, sizeof(buffer32), &bytesRead, 100);
-        int samplesRead = bytesRead / 4;
+        // Request 1 second of data from the I2S bus, timeout after 1.5 seconds
+        rc = i2s_read(
+            I2S_NUM, 
+            buffer[buf_index], 
+            RECBUF_SIZE, 
+            &bytesRead, 
+            1500 / portTICK_PERIOD_MS);
+
         if (rc != ESP_OK) {
-            ESP_LOGE(TAG, "i2s_read(): rc=%d  bytes=%d\n", rc, bytesRead);
+            ESP_LOGE(
+                TAG, 
+                "i2s_read(): rc=%d  bytes=%d, buf_index=%d\n", 
+                rc, 
+                bytesRead,
+                buf_index);
+        } else {
+            ESP_LOGI(
+                TAG, 
+                "i2s_read(): rc=%d  bytes=%d, buf_index=%d\n", 
+                rc, 
+                bytesRead,
+                buf_index);
         }
 
-        if (fwrite(buffer32, sizeof(int32_t), samplesRead, f) < samplesRead) {
-            ESP_LOGE(TAG, "Failed to write samples.");
-            return; 
-        }
-        
-        samplesWritten += samplesRead;
+        // Now enqueue a request for this to be written to the SD card
+        q_msg m;
+        BaseType_t qrc;
+        get_timestamps(&m.seqno, m.filename, sizeof m.filename);
+        m.buffer = buffer[buf_index];
+        m.len = bytesRead;
+
+        if ((qrc = xQueueSend(queue, (void *)&m, (TickType_t)100)) != pdTRUE) {
+                ESP_LOGE(TAG, "i2s: xQueueSend() failed: rc=%d", qrc);
+            }
+
+        // Move onto the next receive buffer
+        buf_index = (buf_index+1) % NUM_RECBUFS;
 
     }
-
-
-    fclose(f);
-    ESP_LOGI(TAG, "File written");
-
-    // All done, unmount partition and disable SDMMC or SPI peripheral
-    esp_vfs_fat_sdcard_unmount(mount_point, card);
-    ESP_LOGI(TAG, "Card unmounted");
-
-    while (1)
-        ;
-
-    //deinitialize the bus after all devices are removed
-    // spi_bus_free(host.slot);
 }
 
-void read_loop() {
-    
-}
 
 void sd_init(void) {
     esp_err_t ret;
@@ -190,54 +312,10 @@ void sd_init(void) {
 
     ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &card);
 
-        // Card has been initialized, print its properties
+    // Card has been initialized, print its properties
     sdmmc_card_print_info(stdout, card);
 
-    // Use POSIX and C standard library functions to work with files.
-    // First create a file.
-    ESP_LOGI(TAG, "Opening file");
-    FILE* f = fopen(MOUNT_POINT"/hello.txt", "w");
-    if (f == NULL) {
-        ESP_LOGE(TAG, "Failed to open file for writing");
-        return;
-    }
-    fprintf(f, "Hello %s!\n", card->cid.name);
-    fclose(f);
-    ESP_LOGI(TAG, "File written");
-
-    // Check if destination file exists before renaming
-    struct stat st;
-    if (stat(MOUNT_POINT"/foo.txt", &st) == 0) {
-        // Delete it if it exists
-        unlink(MOUNT_POINT"/foo.txt");
-    }
-
-    // Rename original file
-    ESP_LOGI(TAG, "Renaming file");
-    if (rename(MOUNT_POINT"/hello.txt", MOUNT_POINT"/foo.txt") != 0) {
-        ESP_LOGE(TAG, "Rename failed");
-        return;
-    }
-
-    // Open renamed file for reading
-    ESP_LOGI(TAG, "Reading file");
-    f = fopen(MOUNT_POINT"/foo.txt", "r");
-    if (f == NULL) {
-        ESP_LOGE(TAG, "Failed to open file for reading");
-        return;
-    }
-    char line[64];
-    fgets(line, sizeof(line), f);
-    fclose(f);
-    // strip newline
-    char* pos = strchr(line, '\n');
-    if (pos) {
-        *pos = '\0';
-    }
-    ESP_LOGI(TAG, "Read from file: '%s'", line);
-
 }
-
 
 void i2s_init () {
 
@@ -276,4 +354,21 @@ void i2s_init () {
 	PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO0_U, FUNC_GPIO0_CLK_OUT1);
 
     
+}
+
+
+// Utility to populate time variables
+void get_timestamps(int *seconds, char *datetime, size_t datetime_size) {
+    time_t now;
+    struct tm timeinfo;
+
+    time(&now);
+    // Set timezone to China Standard Time
+    setenv("TZ", "UTC", 1);
+    tzset();
+
+    localtime_r(&now, &timeinfo);
+    strftime(datetime, datetime_size, "%Y%m%d-%H%M", &timeinfo);
+    *seconds = timeinfo.tm_sec;
+    ESP_LOGI(TAG, "The current date/time is: %s", datetime);
 }

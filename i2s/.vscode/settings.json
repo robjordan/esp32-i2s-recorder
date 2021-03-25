@@ -12,7 +12,8 @@
   "files.associations": {
     "*.ipp": "c",
     "*.tcc": "c",
-    "*.inc": "c"
+    "*.inc": "c",
+    "*.contiki": "c"
   },
   "idf.flashType": "UART"
 }
