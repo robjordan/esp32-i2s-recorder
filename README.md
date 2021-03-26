@@ -41,6 +41,9 @@ Connections:
 | GPIO19   | MISO  |
 | 5v (via cap) | GND |
 
+### Real-Time Clock
+The system requires a real-time clock, to be able to timestamp audio files correctly. This is not yet implemented.
+
 ## Software
 
 ### Tasks
