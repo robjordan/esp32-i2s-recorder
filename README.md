@@ -40,3 +40,10 @@ Connections:
 | GPIO18 | CLK |
 | GPIO19   | MISO  |
 | 5v (via cap) | GND |
+
+## Software
+
+### Tasks
+The program comprises two tasks:
+- The I<sup>2</sup>S task, which pulls data from the I<sup>2</sup>S bus, and writes it to large memory buffers in PSRAM, which are then enqueued to the SD card task. This overcomes a problem seen in the previous version, where writes to SD card would block for a long period, causes I<sup>2</sup>S data to lost.
+- The SD card task, which waits on a queue for commands from the I<sup>2</sup>S task. Each queued command points to one memory buffer, containing one second of audio (192 KBytes). The queued command also includes a timestamp, to 1 minute resolution, to be used for generating a filename, and a sequence number, which happens to be the number of seconds within that minute.
