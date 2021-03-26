@@ -13,7 +13,7 @@ Requires a stable Vcc of 4.2 - 5V.
 
 ### [ESP32-WROVER-B](https://www.espressif.com/sites/default/files/documentation/esp32-wrover-b_datasheet_en.pdf)
 
-This variant of the ESP32 has 8MB of PSRAM. The ESP32 provides a master clock to the I2S bus, and reads from the the digital audio provided by the ADC module.
+This variant of the ESP32 has 8MB of PSRAM. The ESP32 provides a master clock to the I2S bus, and reads from the the digital audio provided by the ADC module. It then writes the audio data to SD card.
 
 Connections:
 
@@ -26,3 +26,17 @@ Connections:
 | GND    | GND  |
 | 5v (via cap) | VCC |
 
+### [SD card adapter](https://www.aliexpress.com/item/32867572635.html)
+
+Provides interface to persist audio files to Micro SD card. 
+
+Connections:
+
+| ESP32  | SD card   |
+|--------|-------|
+| 3V3 | 3V3  |
+| GPIO5 | CS |
+| GPIO23 | MOSI |
+| GPIO18 | CLK |
+| GPIO19   | MISO  |
+| 5v (via cap) | GND |
