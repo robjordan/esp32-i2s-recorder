@@ -9,6 +9,7 @@
 #include <math.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
+#include <errno.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -156,15 +157,18 @@ void app_main(void)
 
 void sd_task(void * pvParameters) {
     ESP_LOGI(TAG, "sd_task, starting up.");
-    sd_init();
     static char prev_filename[256];
     static uint32_t audio_bytes = 0;
+    int rc;
+
+    sd_init();
 
     while (true) {
         BaseType_t qrc;
         q_msg m;
         char filename[256];
         size_t written;
+        FILE *f;
 
         // Read a command from the queue, wait for up to 2 seconds
         while ((qrc = xQueueReceive(queue, (void *)&m, 2000 / portTICK_PERIOD_MS))
@@ -176,17 +180,60 @@ void sd_task(void * pvParameters) {
         // Now we have got a queue element, write the buffer to disk
         // The filename is in the Q msg, less the .raw suffix
         sprintf(filename, "%s/%s.wav", MOUNT_POINT, m.filename);
-        strncpy(prev_filename, filename, sizeof prev_filename);
-
-        FILE* f = fopen(filename, "a");
-        if (f == NULL) {
-            ESP_LOGE(TAG, "sd_task: Failed to open file, %s", filename);
-            continue;  // skip to next iteration, hope it works better next time
-        }
 
         // If the seqno indicates this is the first buffer of a new file
-        // do some initialisation.
+        // and we wrote something to the previous file, finish it off by adding
+        // number of bytes in the file.
+        if (m.seqno == 0 && audio_bytes > 0) {
+            wav_header new_hdr = wav_hdr;
+            new_hdr.wav_size = audio_bytes + 36;
+            new_hdr.data_bytes = audio_bytes;
+            ESP_LOGI(
+                TAG, 
+                "sd_task: file: %s, chunk: %d, subchunk2: %d", 
+                prev_filename,
+                new_hdr.wav_size, 
+                new_hdr.data_bytes
+            );
+            FILE* prev = fopen(prev_filename, "r+");
+            if (prev == NULL) {
+                ESP_LOGE(TAG, "sd_task: Failed to open file, %s", prev_filename);
+            }
+            else if ((rc = fseek(prev, 0, SEEK_SET)) != 0) {
+                ESP_LOGE(TAG, "sd_task: Failed to fseek(), rc: %d", rc);             
+            }
+            else if ((written = fwrite(
+                        (const void *)&new_hdr, 
+                        sizeof new_hdr, 
+                        1, 
+                        prev
+                    )) < 1) {
+                        ESP_LOGE(
+                            TAG, 
+                            "sd_task: Failed to rewrite WAV header, tried: %d, wrote: %d, %s",
+                            sizeof new_hdr,
+                            written,
+                            strerror(errno));
+            } else {
+                ESP_LOGI(TAG, "sd_task: rewrote WAV header");
+            }
+            fclose(prev);
+        }       
+
+        // Save the filename written in this pass, so we can later update it
+        strncpy(prev_filename, filename, sizeof prev_filename);
+
+        // If the seqno indicates this is the first buffer of a new file then
+        // write a WAV file header.
         if (m.seqno == 0 || audio_bytes == 0) {
+
+            // New file, truncate it
+            f = fopen(filename, "w");
+            if (f == NULL) {
+                ESP_LOGE(TAG, "sd_task: Failed to open new file, %s", filename);
+                continue;
+            }
+
             audio_bytes = 0;
             if (fwrite((void *)&wav_hdr, 1, sizeof wav_hdr, f) < sizeof wav_hdr) {
                 ESP_LOGE(TAG, "sd_task: Failed to write WAV header");
@@ -194,6 +241,14 @@ void sd_task(void * pvParameters) {
                 continue;                 
             } else {
                 ESP_LOGI(TAG, "sd_task: Wrote WAV header");               
+            }
+        } else {
+
+            // Not a new file, open it for append
+            f = fopen(filename, "a");
+            if (f == NULL) {
+                ESP_LOGE(TAG, "sd_task: Failed to reopen file, %s", filename);
+                continue;  
             }
         }
 
@@ -363,12 +418,11 @@ void get_timestamps(int *seconds, char *datetime, size_t datetime_size) {
     struct tm timeinfo;
 
     time(&now);
-    // Set timezone to China Standard Time
+    // Set timezone to Universal Cooordinated Time
     setenv("TZ", "UTC", 1);
     tzset();
 
     localtime_r(&now, &timeinfo);
     strftime(datetime, datetime_size, "%Y%m%d-%H%M", &timeinfo);
     *seconds = timeinfo.tm_sec;
-    ESP_LOGI(TAG, "The current date/time is: %s", datetime);
 }
